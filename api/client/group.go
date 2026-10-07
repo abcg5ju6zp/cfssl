@@ -64,6 +64,10 @@ func NewGroup(remotes []string, tlsConfig *tls.Config, strategy Strategy) (Remot
 
 type orderedListGroup struct {
 	remotes []*server
+	// reqModifier is the modifier applied to every member so that
+	// the same request decoration (custom headers, signing material,
+	// etc.) is used on each candidate address.
+	reqModifier func(*http.Request, []byte)
 }
 
 func (g *orderedListGroup) Hosts() []string {
@@ -93,40 +97,64 @@ func newOrdererdListGroup(remotes []*server) (Remote, error) {
 	}, nil
 }
 
-func (g *orderedListGroup) AuthSign(req, id []byte, provider auth.Provider) (resp []byte, err error) {
-	for i := range g.remotes {
-		resp, err = g.remotes[i].AuthSign(req, id, provider)
+// orderedFailover runs op against the group members in configuration
+// order. The first candidate that returns a valid result stops the
+// failover. When every candidate fails the error from the last
+// attempted remote is returned so the caller keeps the most recent
+// diagnostic information.
+func orderedFailover[T any](remotes []*server, op func(*server) (T, error)) (T, error) {
+	var zero T
+	var lastErr error
+	for _, srv := range remotes {
+		result, err := op(srv)
 		if err == nil {
-			return resp, nil
+			return result, nil
 		}
+		lastErr = err
 	}
-
-	return nil, err
+	if lastErr == nil {
+		return zero, errors.New("no remote servers configured")
+	}
+	return zero, lastErr
 }
 
-func (g *orderedListGroup) Sign(jsonData []byte) (resp []byte, err error) {
-	for i := range g.remotes {
-		resp, err = g.remotes[i].Sign(jsonData)
-		if err == nil {
-			return resp, nil
-		}
+// AuthSign performs the authenticated signing request. The
+// authenticated request body (token, timestamp and inner request) is
+// built a single time and then sent unchanged to the "authsign"
+// endpoint of each candidate, in configuration order.
+func (g *orderedListGroup) AuthSign(req, id []byte, provider auth.Provider) ([]byte, error) {
+	jsonData, err := newAuthenticatedRequestBody(req, id, provider)
+	if err != nil {
+		return nil, err
 	}
-
-	return nil, err
+	return orderedFailover(g.remotes, func(srv *server) ([]byte, error) {
+		return srv.sendAuthenticatedRequest(jsonData, "sign")
+	})
 }
 
-func (g *orderedListGroup) Info(jsonData []byte) (resp *info.Resp, err error) {
-	for i := range g.remotes {
-		resp, err = g.remotes[i].Info(jsonData)
-		if err == nil {
-			return resp, nil
-		}
-	}
-
-	return nil, err
+// Sign sends the same signing request body to the "sign" endpoint of
+// each candidate, in configuration order.
+func (g *orderedListGroup) Sign(jsonData []byte) ([]byte, error) {
+	return orderedFailover(g.remotes, func(srv *server) ([]byte, error) {
+		return srv.Sign(jsonData)
+	})
 }
 
-// SetReqModifier does nothing because there is no request modifier for group
+// Info sends the same info request body to the "info" endpoint of each
+// candidate, in configuration order.
+func (g *orderedListGroup) Info(jsonData []byte) (*info.Resp, error) {
+	return orderedFailover(g.remotes, func(srv *server) (*info.Resp, error) {
+		return srv.Info(jsonData)
+	})
+}
+
+// SetReqModifier propagates the request modifier to every member of the
+// group. Each member invokes the modifier a single time per request it
+// sends, so the identical decoration is applied to every candidate
+// address tried during failover.
 func (g *orderedListGroup) SetReqModifier(mod func(*http.Request, []byte)) {
-	// noop
+	g.reqModifier = mod
+	for _, srv := range g.remotes {
+		srv.SetReqModifier(mod)
+	}
 }

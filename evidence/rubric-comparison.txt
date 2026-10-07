@@ -1,0 +1,16 @@
+项目：cloudflare-cfssl｜题目 ID：cloudflare-cfssl-f5e17519-991d-4893-bdb2-65ea33455f66
+固定基线：ab47f0d984778865b3f5b5adf6ba336a15b96c31｜Session：586499748533644:86083cd652f3e5dc40ca7fccf1de229c_6ac604327e3ad4c77d0fe02c.6ac604327e3ad4c77d0fe02f.6ac604327e3ad4c77d0fe02d:TraeCode CN.3.3.104.no_sid.no_ppe.T(2026/10/7 16:34:58)
+Harness：Trae｜有效轮数：21｜来源：count-trae-cn-steps.py｜范围：latest_turn
+完成度：完成｜收录结论：不收录
+验证命令：go test -count=1 ./api/client
+
+Rubric ID：1｜状态：通过｜期望行为：ordered_list 的每个候选地址都会对签名、信息和带鉴权请求应用一次相同的请求修饰，不能只在单地址 Remote 生效。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/client/group.go; api/client/client.go; api/client/client_test.go；go test -count=1 ./api/client
+Rubric ID：2｜状态：通过｜期望行为：请求切换候选地址时保持相同的请求体、目标方法和鉴权材料，不会因重试而重复修改请求内容。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/client/group.go; api/client/client.go; api/client/client_test.go；go test -count=1 ./api/client
+Rubric ID：3｜状态：通过｜期望行为：首个地址失败时按配置顺序尝试后续地址，任一地址返回有效结果后立即停止继续请求。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/client/group.go; api/client/client.go; api/client/client_test.go；go test -count=1 ./api/client
+Rubric ID：4｜状态：通过｜期望行为：所有候选地址都失败时返回最后一个有诊断价值的错误，而不是丢失前面请求的失败上下文。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/client/group.go; api/client/client.go; api/client/client_test.go；go test -count=1 ./api/client
+Rubric ID：5｜状态：通过｜期望行为：组级请求超时和代理设置会传递到每个候选地址，并在切换过程中保持一致。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/client/group.go; api/client/client.go; api/client/client_test.go；go test -count=1 ./api/client
+Rubric ID：6｜状态：通过｜期望行为：Hosts 查询继续返回配置中各候选地址的顺序列表，单地址 Remote 的 Hosts 与请求行为保持原有结果。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/client/group.go; api/client/client.go; api/client/client_test.go；go test -count=1 ./api/client
+Rubric ID：7｜状态：通过｜期望行为：既有成功响应、HTTP 错误、服务端错误和无效地址的返回类别在普通 Remote 与 ordered_list Remote 中保持兼容。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/client/group.go; api/client/client.go; api/client/client_test.go；go test -count=1 ./api/client
+
+Prompt-Rubric 对齐：冻结 Prompt 已拆分为入口、状态、失败恢复、重启、并发和兼容性要求；每条 Rubric 均可回指原始 Prompt，未增加接口、文件、错误码、性能或部署条件。
+审计边界：仅使用本题固定版本、一次 Session、冻结 Rubric 和当前项目改动；未使用其他题目、其他 Session 或重跑材料替代原始运行事实。

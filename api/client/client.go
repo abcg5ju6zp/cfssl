@@ -120,9 +120,11 @@ func (srv *server) createTransport() *http.Transport {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	// Setup HTTPS client
-	tlsConfig := srv.TLSConfig
-	tlsConfig.BuildNameToCertificate()
-	transport.TLSClientConfig = tlsConfig
+	if srv.TLSConfig != nil {
+		tlsConfig := srv.TLSConfig
+		tlsConfig.BuildNameToCertificate()
+		transport.TLSClientConfig = tlsConfig
+	}
 	// Setup Proxy
 	if srv.proxy != nil {
 		transport.Proxy = srv.proxy
@@ -135,7 +137,7 @@ func (srv *server) post(url string, jsonData []byte) (*api.Response, error) {
 	var resp *http.Response
 	var err error
 	client := &http.Client{}
-	if srv.TLSConfig != nil {
+	if srv.TLSConfig != nil || srv.proxy != nil {
 		client.Transport = srv.createTransport()
 	}
 	if srv.RequestTimeout != 0 {
@@ -204,9 +206,19 @@ func (srv *server) AuthInfo(req, id []byte, provider auth.Provider) ([]byte, err
 // authReq is the common logic for AuthSign and AuthInfo -- perform the given
 // request, and return the resultant certificate.
 // The target is either 'sign' or 'info'.
-func (srv *server) authReq(req, ID []byte, provider auth.Provider, target string) ([]byte, error) {
-	url := srv.getURL("auth" + target)
+func (srv *server) authReq(req, id []byte, provider auth.Provider, target string) ([]byte, error) {
+	jsonData, err := newAuthenticatedRequestBody(req, id, provider)
+	if err != nil {
+		return nil, err
+	}
+	return srv.sendAuthenticatedRequest(jsonData, target)
+}
 
+// newAuthenticatedRequestBody builds the serialised authenticated request
+// envelope (token, timestamp and request body). It is invoked a single time
+// per logical request so that every candidate in a remote group receives the
+// identical request body.
+func newAuthenticatedRequestBody(req, id []byte, provider auth.Provider) ([]byte, error) {
 	token, err := provider.Token(req)
 	if err != nil {
 		return nil, errors.Wrap(errors.APIClientError, errors.AuthenticationFailure, err)
@@ -214,7 +226,7 @@ func (srv *server) authReq(req, ID []byte, provider auth.Provider, target string
 
 	aReq := &auth.AuthenticatedRequest{
 		Timestamp:     time.Now().Unix(),
-		RemoteAddress: ID,
+		RemoteAddress: id,
 		Token:         token,
 		Request:       req,
 	}
@@ -223,8 +235,14 @@ func (srv *server) authReq(req, ID []byte, provider auth.Provider, target string
 	if err != nil {
 		return nil, errors.Wrap(errors.APIClientError, errors.JSONError, err)
 	}
+	return jsonData, nil
+}
 
-	response, err := srv.post(url, jsonData)
+// sendAuthenticatedRequest posts a serialised AuthenticatedRequest to the
+// given authenticated target ("sign" or "info") and returns the certificate
+// in the response.
+func (srv *server) sendAuthenticatedRequest(jsonData []byte, target string) ([]byte, error) {
+	response, err := srv.post(srv.getURL("auth"+target), jsonData)
 	if err != nil {
 		return nil, err
 	}
