@@ -3,6 +3,8 @@ package revoke
 
 import (
 	"encoding/json"
+	stderrors "errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -53,7 +55,17 @@ type jsonRevokeRequest struct {
 }
 
 // Handle responds to revocation requests. It attempts to revoke
-// a certificate with a given serial number
+// a certificate with a given serial number.
+//
+// When the backing accessor implements certdb.RevocationManager the
+// revocation is committed as one resumable generation: serial/AKI and
+// current status are validated first, then the certificate record (and
+// CRL input), the immutable revocation reason/time and the OCSP
+// candidate switch together. Any failure or process exit before the
+// switch leaves the previous consistent state in place, and pending
+// generations are resumed here instead of being started over, so repeat
+// requests are idempotent and can never overwrite the committed
+// revocation time/reason or restore a revoked certificate.
 func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) error {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -78,7 +90,103 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) error {
 		return errors.NewBadRequestString("Invalid reason code")
 	}
 
-	err = h.dbAccessor.RevokeCertificate(req.Serial, req.AKI, reasonCode)
+	manager, managed := h.dbAccessor.(certdb.RevocationManager)
+	if !managed {
+		return h.handleLegacy(req, reasonCode, w)
+	}
+
+	// Recover generations left unconfirmed by a failed request or a
+	// process exit: only the pending switch is repeated, nothing is
+	// restarted. Best effort; a failure here must not block new
+	// revocations.
+	if err = h.recoverPending(manager); err != nil {
+		return err
+	}
+
+	// Validate serial/AKI before recording any intent.
+	crs, err := h.dbAccessor.GetCertificate(req.Serial, req.AKI)
+	if err != nil {
+		return err
+	}
+	if len(crs) == 0 {
+		return errors.Wrap(errors.CertStoreError, errors.RecordNotFound,
+			stderrors.New("failed to revoke the certificate: certificate not found"))
+	}
+	if len(crs) != 1 {
+		return errors.NewBadRequestString("No unique certificate found")
+	}
+
+	// Begin the generation (or adopt the existing one: repeat
+	// revocations are idempotent and keep the first reason/time).
+	rec, err := manager.BeginRevocation(req.Serial, req.AKI, reasonCode)
+	if err != nil {
+		return err
+	}
+
+	// Prepare the OCSP candidate before anything becomes visible. The
+	// candidate is derived from the immutable journal, so retries and
+	// stale tasks sign the same reason/revocation time; the stored
+	// candidate is first-writer-wins.
+	if h.Signer != nil && rec.OCSPBody == "" {
+		cert, perr := helpers.ParseCertificatePEM([]byte(crs[0].PEM))
+		if perr != nil {
+			return errors.NewBadRequestString("Unable to parse certificates from PEM data")
+		}
+
+		sr := ocsp.SignRequest{
+			Certificate: cert,
+			Status:      "revoked",
+			Reason:      rec.Reason,
+			RevokedAt:   rec.RevokedAt,
+		}
+		var ocspResponse []byte
+		ocspResponse, err = h.Signer.Sign(sr)
+		if err != nil {
+			return err
+		}
+
+		var ocspParsed *stdocsp.Response
+		ocspParsed, err = stdocsp.ParseResponse(ocspResponse, nil)
+		if err != nil {
+			return err
+		}
+
+		if err = manager.SetRevocationOCSP(req.Serial, req.AKI,
+			string(ocspResponse), ocspParsed.NextUpdate); err != nil {
+			return err
+		}
+	}
+
+	// Atomic switch: certificate record/CRL input plus the OCSP
+	// candidate become visible together, or not at all.
+	if err = manager.CommitRevocation(req.Serial, req.AKI); err != nil {
+		return err
+	}
+
+	result := map[string]string{}
+	return api.SendResponse(w, result)
+}
+
+// recoverPending resumes generations with unconfirmed steps. Pending
+// generations either carry their signed OCSP candidate already or were
+// created without one, so the switch needs no signer here.
+func (h *Handler) recoverPending(manager certdb.RevocationManager) error {
+	pending, err := manager.PendingRevocations()
+	if err != nil {
+		return err
+	}
+	for _, rec := range pending {
+		if err := manager.CommitRevocation(rec.Serial, rec.AKI); err != nil {
+			return fmt.Errorf("resuming revocation for serial %s AKI %s: %w", rec.Serial, rec.AKI, err)
+		}
+	}
+	return nil
+}
+
+// handleLegacy preserves the original revoke behaviour for accessors
+// that do not implement the resumable RevocationManager extension.
+func (h *Handler) handleLegacy(req jsonRevokeRequest, reasonCode int, w http.ResponseWriter) error {
+	err := h.dbAccessor.RevokeCertificate(req.Serial, req.AKI, reasonCode)
 	if err != nil {
 		return err
 	}

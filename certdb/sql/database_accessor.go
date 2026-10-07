@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -64,6 +65,10 @@ SELECT %s FROM ocsp_responses
 
 	selectOCSPSQL = `
 SELECT %s FROM ocsp_responses
+  WHERE (serial_number = ? AND authority_key_identifier = ?);`
+
+	selectCertStatusSQL = `
+SELECT status FROM certificates
   WHERE (serial_number = ? AND authority_key_identifier = ?);`
 )
 
@@ -409,4 +414,90 @@ func (d *Accessor) UpsertOCSP(serial, aki, body string, expiry time.Time) error 
 	}
 
 	return err
+}
+
+// UpsertOCSPIfCurrent updates (or inserts) the OCSP record for a serial
+// only while the certificate still has certStatus in the database, i.e.
+// the status the response was signed from. The status check and the
+// write happen in one transaction. If the certificate changed in the
+// meantime (typically a concurrent revocation switch), the write is
+// skipped, so a stale OCSP refresh task can never restore a revoked
+// certificate with an older "good" response. Behavior for unchanged,
+// unrevoked certificates is identical to UpsertOCSP.
+func (d *Accessor) UpsertOCSPIfCurrent(serial, aki, body string, expiry time.Time, certStatus string) error {
+	err := d.checkDB()
+	if err != nil {
+		return err
+	}
+
+	tx, err := d.db.Beginx()
+	if err != nil {
+		return wrapSQLError(err)
+	}
+	defer tx.Rollback()
+
+	// Lock the certificate row on row-locking backends so a revocation
+	// switch cannot commit between the status check and the OCSP write.
+	statusQuery := selectCertStatusSQL
+	if d.db.DriverName() == "mysql" || d.db.DriverName() == "postgres" {
+		statusQuery += " FOR UPDATE"
+	}
+
+	var status string
+	err = tx.Get(&status, tx.Rebind(statusQuery), serial, aki)
+	if err == sql.ErrNoRows {
+		return cferr.Wrap(cferr.CertStoreError, cferr.RecordNotFound,
+			fmt.Errorf("certificate not found while updating OCSP record"))
+	}
+	if err != nil {
+		return wrapSQLError(err)
+	}
+
+	// The cert record moved on since the response was derived; let a
+	// later refresh (or the revocation generation) publish the matching
+	// response instead.
+	if status != certStatus {
+		return nil
+	}
+
+	record := certdb.OCSPRecord{
+		AKI:    aki,
+		Body:   body,
+		Expiry: expiry.UTC(),
+		Serial: serial,
+	}
+
+	result, err := tx.NamedExec(updateOCSPSQL, &record)
+	if err != nil {
+		return wrapSQLError(err)
+	}
+
+	numRowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return wrapSQLError(err)
+	}
+
+	if numRowsAffected == 0 {
+		result, err = tx.NamedExec(insertOCSPSQL, &record)
+		if err != nil {
+			return wrapSQLError(err)
+		}
+		numRowsAffected, err = result.RowsAffected()
+		if err != nil {
+			return wrapSQLError(err)
+		}
+		if numRowsAffected == 0 {
+			return cferr.Wrap(cferr.CertStoreError, cferr.InsertionFailed,
+				fmt.Errorf("failed to insert the OCSP record"))
+		}
+	}
+
+	if numRowsAffected != 1 {
+		return wrapSQLError(fmt.Errorf("%d rows are affected, should be 1 row", numRowsAffected))
+	}
+
+	if err = tx.Commit(); err != nil {
+		return wrapSQLError(err)
+	}
+	return nil
 }

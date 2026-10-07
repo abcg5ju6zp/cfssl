@@ -1,0 +1,16 @@
+项目：cloudflare-cfssl｜题目 ID：cloudflare-cfssl-b6efc4a9-94bb-4e0d-a2a5-2d58c15eb69c
+固定基线：ab47f0d984778865b3f5b5adf6ba336a15b96c31｜Session：586499748533644:d14981168700c337265a4a9a61b49261_6ac604307e3ad4c77d0fe01b.6ac604317e3ad4c77d0fe01e.6ac604307e3ad4c77d0fe01c:TraeCode CN.3.3.104.no_sid.no_ppe.T(2026/10/7 16:34:57)
+Harness：Trae｜有效轮数：65｜来源：count-trae-cn-steps.py｜范围：latest_turn
+完成度：完成｜收录结论：不收录
+验证命令：go test -count=1 ./api/revoke
+
+Rubric ID：1｜状态：通过｜期望行为：撤销前校验 serial、AKI、原因和当前状态，未知或已完成状态得到稳定结果。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/revoke/revoke.go; certdb/sql/revocation.go; api/revoke/revoke_test.go；go test -count=1 ./api/revoke
+Rubric ID：2｜状态：通过｜期望行为：证书记录、撤销原因/时间、CRL 输入和 OCSP 候选按同一代际确认。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/revoke/revoke.go; certdb/sql/revocation.go; api/revoke/revoke_test.go；go test -count=1 ./api/revoke
+Rubric ID：3｜状态：通过｜期望行为：数据库、CRL 或 OCSP 任一步失败时查询仍返回上一一致状态。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/revoke/revoke.go; certdb/sql/revocation.go; api/revoke/revoke_test.go；go test -count=1 ./api/revoke
+Rubric ID：4｜状态：通过｜期望行为：重启会继续未确认撤销或清理候选，已确认撤销不会丢失。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/revoke/revoke.go; certdb/sql/revocation.go; api/revoke/revoke_test.go；go test -count=1 ./api/revoke
+Rubric ID：5｜状态：通过｜期望行为：重复撤销幂等，迟到旧任务不能把已撤销证书恢复为 good。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/revoke/revoke.go; certdb/sql/revocation.go; api/revoke/revoke_test.go；go test -count=1 ./api/revoke
+Rubric ID：6｜状态：通过｜期望行为：CRL、OCSP 和 revoke 查询只读取同一确认代际并给出可诊断错误。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/revoke/revoke.go; certdb/sql/revocation.go; api/revoke/revoke_test.go；go test -count=1 ./api/revoke
+Rubric ID：7｜状态：通过｜期望行为：未撤销证书的签发、空撤销库和既有 API 响应格式保持通过。｜实际观察：生产入口沿真实调用图完成提交、失败、恢复、并发与兼容边界审计；定向验证命令返回 exit 0，相关测试覆盖该行为。｜直接证据：api/revoke/revoke.go; certdb/sql/revocation.go; api/revoke/revoke_test.go；go test -count=1 ./api/revoke
+
+Prompt-Rubric 对齐：冻结 Prompt 已拆分为入口、状态、失败恢复、重启、并发和兼容性要求；每条 Rubric 均可回指原始 Prompt，未增加接口、文件、错误码、性能或部署条件。
+审计边界：仅使用本题固定版本、一次 Session、冻结 Rubric 和当前项目改动；未使用其他题目、其他 Session 或重跑材料替代原始运行事实。

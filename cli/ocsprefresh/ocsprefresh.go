@@ -87,7 +87,14 @@ func ocsprefreshMain(args []string, c cli.Config) error {
 			return err
 		}
 
-		err = dbAccessor.UpsertOCSP(cert.SerialNumber.String(), hex.EncodeToString(cert.AuthorityKeyId), string(resp), ocspExpiry)
+		// Only publish the response while the certificate status in the
+		// DB still matches the status the response was signed for. If a
+		// revocation switched the status after this loop read the
+		// certificate, the write is skipped so a stale refresh can never
+		// restore a revoked certificate with an older "good" response.
+		err = dbAccessor.UpsertOCSPIfCurrent(cert.SerialNumber.String(),
+			hex.EncodeToString(cert.AuthorityKeyId), string(resp), ocspExpiry,
+			certRecord.Status)
 		if err != nil {
 			log.Critical("Unable to save OCSP response: ", err)
 			return err
