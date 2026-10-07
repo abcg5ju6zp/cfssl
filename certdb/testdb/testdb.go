@@ -14,6 +14,7 @@ const (
 	mysqlTruncateTables = `
 TRUNCATE certificates;
 TRUNCATE ocsp_responses;
+TRUNCATE ocsp_responses_pending;
 `
 
 	pgTruncateTables = `
@@ -37,6 +38,7 @@ SELECT truncate_tables();
 	sqliteTruncateTables = `
 DELETE FROM certificates;
 DELETE FROM ocsp_responses;
+DELETE FROM ocsp_responses_pending;
 `
 )
 

@@ -1,12 +1,14 @@
 package sql
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/cloudflare/cfssl/certdb"
 	cferr "github.com/cloudflare/cfssl/errors"
+	"github.com/cloudflare/cfssl/log"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/kisielk/sqlstruct"
@@ -65,6 +67,41 @@ SELECT %s FROM ocsp_responses
 	selectOCSPSQL = `
 SELECT %s FROM ocsp_responses
   WHERE (serial_number = ? AND authority_key_identifier = ?);`
+
+	insertPendingOCSPSQL = `
+INSERT INTO ocsp_responses_pending (serial_number, authority_key_identifier, body, expiry, generated_at)
+  VALUES (:serial_number, :authority_key_identifier, :body, :expiry, :generated_at);`
+
+	updatePendingOCSPSQL = `
+UPDATE ocsp_responses_pending
+  SET body = :body, expiry = :expiry, generated_at = :generated_at
+	WHERE (serial_number = :serial_number AND authority_key_identifier = :authority_key_identifier);`
+
+	selectAllPendingOCSPSQL = `
+SELECT %s FROM ocsp_responses_pending;`
+
+	deletePendingOCSPSQL = `
+DELETE FROM ocsp_responses_pending
+  WHERE (serial_number = ? AND authority_key_identifier = ?);`
+
+	// confirmUpdateOCSPSQL only replaces the stored response when the
+	// candidate is strictly newer than what is currently committed, so a
+	// delayed refresh can never roll back a response produced by a more
+	// recent run. Records predating migration 002 carry the epoch/zero
+	// generation timestamp and are therefore always eligible for refresh.
+	confirmUpdateOCSPSQL = `
+UPDATE ocsp_responses
+  SET body = :body, expiry = :expiry, generated_at = :generated_at
+	WHERE (serial_number = :serial_number AND authority_key_identifier = :authority_key_identifier)
+	  AND generated_at < :generated_at;`
+
+	selectOCSPGeneratedAtSQL = `
+SELECT generated_at FROM ocsp_responses
+  WHERE (serial_number = ? AND authority_key_identifier = ?);`
+
+	insertOCSPWithGeneratedSQL = `
+INSERT INTO ocsp_responses (serial_number, authority_key_identifier, body, expiry, generated_at)
+  VALUES (:serial_number, :authority_key_identifier, :body, :expiry, :generated_at);`
 )
 
 // Accessor implements certdb.Accessor interface.
@@ -409,4 +446,178 @@ func (d *Accessor) UpsertOCSP(serial, aki, body string, expiry time.Time) error 
 	}
 
 	return err
+}
+
+// InsertPendingOCSP reserves an unconfirmed refresh slot. Only the serial
+// and AKI are meaningful on input; body/expiry/generated_at are written as
+// zero values until a candidate response has been generated and validated.
+func (d *Accessor) InsertPendingOCSP(rr certdb.OCSPRecord) error {
+	err := d.checkDB()
+	if err != nil {
+		return err
+	}
+
+	result, err := d.db.NamedExec(insertPendingOCSPSQL, &certdb.OCSPRecord{
+		AKI:         rr.AKI,
+		Body:        rr.Body,
+		Expiry:      rr.Expiry.UTC(),
+		GeneratedAt: rr.GeneratedAt.UTC(),
+		Serial:      rr.Serial,
+	})
+	if err != nil {
+		return wrapSQLError(err)
+	}
+
+	numRowsAffected, err := result.RowsAffected()
+
+	if numRowsAffected == 0 {
+		return cferr.Wrap(cferr.CertStoreError, cferr.InsertionFailed, fmt.Errorf("failed to insert the pending OCSP record"))
+	}
+
+	if numRowsAffected != 1 {
+		return wrapSQLError(fmt.Errorf("%d rows are affected, should be 1 row", numRowsAffected))
+	}
+
+	return err
+}
+
+// UpdatePendingOCSP stores a freshly generated and validated candidate
+// response in the pending slot.
+func (d *Accessor) UpdatePendingOCSP(rr certdb.OCSPRecord) error {
+	err := d.checkDB()
+	if err != nil {
+		return err
+	}
+
+	result, err := d.db.NamedExec(updatePendingOCSPSQL, &certdb.OCSPRecord{
+		AKI:         rr.AKI,
+		Body:        rr.Body,
+		Expiry:      rr.Expiry.UTC(),
+		GeneratedAt: rr.GeneratedAt.UTC(),
+		Serial:      rr.Serial,
+	})
+	if err != nil {
+		return wrapSQLError(err)
+	}
+
+	numRowsAffected, err := result.RowsAffected()
+
+	if numRowsAffected == 0 {
+		return cferr.Wrap(cferr.CertStoreError, cferr.RecordNotFound, fmt.Errorf("failed to update the pending OCSP record"))
+	}
+
+	if numRowsAffected != 1 {
+		return wrapSQLError(fmt.Errorf("%d rows are affected, should be 1 row", numRowsAffected))
+	}
+
+	return err
+}
+
+// GetPendingOCSPs retrieves all unconfirmed OCSP refresh candidates.
+func (d *Accessor) GetPendingOCSPs() (ors []certdb.OCSPRecord, err error) {
+	err = d.checkDB()
+	if err != nil {
+		return nil, err
+	}
+
+	err = d.db.Select(&ors, fmt.Sprintf(d.db.Rebind(selectAllPendingOCSPSQL), sqlstruct.Columns(certdb.OCSPRecord{})))
+	if err != nil {
+		return nil, wrapSQLError(err)
+	}
+
+	return ors, nil
+}
+
+// DeletePendingOCSP removes a pending slot. Missing rows are not an error.
+func (d *Accessor) DeletePendingOCSP(serial, aki string) error {
+	err := d.checkDB()
+	if err != nil {
+		return err
+	}
+
+	_, err = d.db.Exec(d.db.Rebind(deletePendingOCSPSQL), serial, aki)
+	if err != nil {
+		return wrapSQLError(err)
+	}
+
+	return nil
+}
+
+// ConfirmOCSPs promotes one batch of pending candidates inside a single
+// transaction. A candidate replaces the stored response only when its
+// GeneratedAt is strictly newer; responses committed by a more recent run
+// are never rolled back. The pending row is removed whether the candidate
+// was promoted or skipped, so after a successful commit every record in
+// the batch is confirmed. A transaction failure rolls the whole batch
+// back and leaves its rows pending for the next run.
+func (d *Accessor) ConfirmOCSPs(records []certdb.OCSPRecord) error {
+	err := d.checkDB()
+	if err != nil {
+		return err
+	}
+
+	if len(records) == 0 {
+		return nil
+	}
+
+	tx, err := d.db.Beginx()
+	if err != nil {
+		return wrapSQLError(err)
+	}
+	defer tx.Rollback()
+
+	for _, rr := range records {
+		rec := certdb.OCSPRecord{
+			AKI:         rr.AKI,
+			Body:        rr.Body,
+			Expiry:      rr.Expiry.UTC(),
+			GeneratedAt: rr.GeneratedAt.UTC(),
+			Serial:      rr.Serial,
+		}
+
+		result, err := tx.NamedExec(confirmUpdateOCSPSQL, &rec)
+		if err != nil {
+			return wrapSQLError(err)
+		}
+
+		numRowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return wrapSQLError(err)
+		}
+
+		if numRowsAffected == 0 {
+			// Either no committed response exists yet, or a response at
+			// least as new as the candidate is already present.
+			var existingGeneratedAt time.Time
+			err = tx.Get(&existingGeneratedAt, d.db.Rebind(selectOCSPGeneratedAtSQL), rr.Serial, rr.AKI)
+			switch {
+			case err == sql.ErrNoRows:
+				// No response exists: insert the candidate. If a
+				// concurrent transaction inserts in between, fall back to
+				// the guarded update so the newer response still wins.
+				if _, err = tx.NamedExec(insertOCSPWithGeneratedSQL, &rec); err != nil {
+					if _, err = tx.NamedExec(confirmUpdateOCSPSQL, &rec); err != nil {
+						return wrapSQLError(err)
+					}
+				}
+			case err != nil:
+				return wrapSQLError(err)
+			default:
+				// A response with an equal or later GeneratedAt is
+				// already committed; keep it and just clear the slot.
+				log.Debugf("Skipping older OCSP candidate for serial %s (candidate %s, committed %s)",
+					rr.Serial, rec.GeneratedAt, existingGeneratedAt)
+			}
+		}
+
+		if _, err = tx.Exec(d.db.Rebind(deletePendingOCSPSQL), rr.Serial, rr.AKI); err != nil {
+			return wrapSQLError(err)
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		return wrapSQLError(err)
+	}
+
+	return nil
 }

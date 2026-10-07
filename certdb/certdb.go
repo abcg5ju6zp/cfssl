@@ -68,6 +68,11 @@ type OCSPRecord struct {
 	AKI    string    `db:"authority_key_identifier"`
 	Body   string    `db:"body"`
 	Expiry time.Time `db:"expiry"`
+	// GeneratedAt records when the OCSP response body was produced. It is
+	// used by the refresh logic to avoid overwriting a newer response with a
+	// stale candidate. It is zero-valued for records written before
+	// migration 002 was applied.
+	GeneratedAt time.Time `db:"generated_at"`
 }
 
 // Accessor abstracts the CRUD of certdb objects from a DB.
@@ -85,4 +90,26 @@ type Accessor interface {
 	GetUnexpiredOCSPs() ([]OCSPRecord, error)
 	UpdateOCSP(serial, aki, body string, expiry time.Time) error
 	UpsertOCSP(serial, aki, body string, expiry time.Time) error
+
+	// InsertPendingOCSP reserves an OCSP refresh slot for the given
+	// serial/AKI in the ocsp_responses_pending table. The row is created
+	// with an empty body; UpdatePendingOCSP fills it in once a validated
+	// candidate has been produced. Leftover rows after a crash identify
+	// the certificates whose refresh was not confirmed.
+	InsertPendingOCSP(rr OCSPRecord) error
+	// UpdatePendingOCSP stores a freshly generated and validated candidate
+	// response in the pending slot.
+	UpdatePendingOCSP(rr OCSPRecord) error
+	// GetPendingOCSPs returns all unconfirmed OCSP refresh candidates.
+	GetPendingOCSPs() ([]OCSPRecord, error)
+	// DeletePendingOCSP removes a pending slot; it is not an error if no
+	// slot exists.
+	DeletePendingOCSP(serial, aki string) error
+	// ConfirmOCSPs promotes a batch of pending candidates into
+	// ocsp_responses within a single transaction. A candidate only
+	// replaces the current response when it is newer (strictly greater
+	// GeneratedAt); a newer response already committed is kept. Each
+	// promoted candidate's pending row is removed, so an interrupted or
+	// failed batch leaves the remaining rows pending for the next run.
+	ConfirmOCSPs(records []OCSPRecord) error
 }
